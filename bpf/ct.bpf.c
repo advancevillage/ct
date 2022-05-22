@@ -7,6 +7,12 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+//存储表控制参数
+#define     CT_MAP_TCP          ct_tcp
+#define     CT_MAP_ANY4         ct_any4
+#define     CT_MAP_SIZE_ANY     4096 
+#define     CT_MAP_SIZE_TCP     4096 
+
 
 //常量定义
 #define CT_EGRESS           0x0
@@ -18,51 +24,67 @@
 #define CT_PASS             0x2
 
 
+//连接跟踪状态
+#define     CT_NEW              (1 << 0)
+#define     CT_ESTABLISHED      (1 << 1)
+#define     CT_REPLY            (1 << 2)
+#define     CT_RELATED          (1 << 3)
+
 //////////////////////////////////////////////////////////////
 
-//连接跟踪元组信息
-struct ct_tuple {
-     struct {
-        __be32          addr;
-
-        union {
-            __be16      all;
-
-            struct {
-                __be16  port;
-            } tcp;
-
-            struct {
-                __be16  port;
-            } udp;
-
-            struct {
-                __u8    type;
-                __u8    code;
-            } icmp;
-        } u;
-
-	    __u8		    l4num;
-
-     } src, dst;
-};
+//连接跟踪元组信息 从cilium移植 cilium-1.11.5/bpf/lib/common.h
+struct ipv4_ct_tuple {
+	/* Address fields are reversed, i.e.,
+	 * these field names are correct for reply direction traffic.
+	 */
+	__be32		daddr;
+	__be32		saddr;
+	/* The order of dport+sport must not be changed!
+	 * These field names are correct for original direction traffic.
+	 */
+	__be16		dport;
+	__be16		sport;
+	__u8		nexthdr;
+	__u8		flags;
+} __packed;
 
 //连接跟踪元组数据
 struct ct_entry {
-	__u64       rx_packets;  //入向包量
-	__u64       rx_bytes;    //入向流量
-	__u64       tx_packets;  //出向包量
-	__u64       tx_bytes;    //出向流量
-	__u32       lifetime;    //有效时间
-	__u16       ifindex;     //网络设备标示
-    __u16       state;       //流状态
-    __u8        l4num;       //L4协议类型
-};
+	__u64 rx_packets;
+	__u64 rx_bytes;
+	__u64 tx_packets;
+	__u64 tx_bytes;
+	__u32 lifetime;
+	/* In the kernel ifindex is u32, so we need to check in cilium-agent
+	 * that ifindex of a NodePort device is <= MAX(u16).
+	 */
+	__u16 ifindex;
 
+	/* *x_flags_seen represents the OR of all TCP flags seen for the
+	 * transmit/receive direction of this entry.
+	 */
+	__u8  tx_flags_seen;
+	__u8  rx_flags_seen;
+};
 
 //////////////////////////////////////////////////////////////
 
 // 存储表
+struct {
+   __uint(type,         BPF_MAP_TYPE_HASH);
+   __type(key,          sizeof(struct ipv4_ct_tuple));
+   __type(value,        sizeof(struct ct_entry));
+   __uint(max_entries,  CT_MAP_SIZE_TCP);
+   __uint(map_flags,    BPF_F_NO_PREALLOC);
+} CT_MAP_TCP SEC(".maps");
+
+struct {
+   __uint(type,         BPF_MAP_TYPE_HASH);
+   __type(key,          sizeof(struct ipv4_ct_tuple));
+   __type(value,        sizeof(struct ct_entry));
+   __uint(max_entries,  CT_MAP_SIZE_ANY);
+   __uint(map_flags,    BPF_F_NO_PREALLOC);
+} CT_MAP_ANY4 SEC(".maps");
 
 
 //函数连接跟踪逻辑 parser--> match action --> deparser
@@ -114,11 +136,14 @@ static __inline __u8 ct(struct xdp_md *ctx, __u8 dir) {
     }
 
     // 解析CT Flow数据
-    switch (iph->protocol) {
+    switch (iph->protocol) { //TODO: flow状态分析 NEW RELATED 
     case 0x01: //icmp
+        //r = handle_ping()
         break;
     case 0x06: //tcp
+        //r = handle_tcp()
         break;
+        //r = handle_udp()
     case 0x11: //udp
         break;
     }
@@ -128,7 +153,7 @@ leave:
 }
 
 SEC("xdp_ct_ingress")
-int xdp_ct_ingress_wan(struct xdp_md *ctx) {
+int ct_ingress_wan(struct xdp_md *ctx) {
     int  xdp_r = XDP_TX;
     __u8 r = ct(ctx, CT_INGRESS);
 
@@ -153,7 +178,7 @@ int xdp_ct_ingress_wan(struct xdp_md *ctx) {
 }
 
 SEC("xdp_ct_egress")
-int xdp_ct_egress_lan(struct xdp_md *ctx) {
+int ct_egress_lan(struct xdp_md *ctx) {
     int  xdp_r = XDP_TX;
     __u8 r = ct(ctx, CT_EGRESS);
 
