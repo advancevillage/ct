@@ -5,6 +5,7 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -17,10 +18,16 @@ struct {
 
 #define PROG(F) SEC("xdp/"__stringify(F)) int bf_##F
 
-#define ingress       0
-#define prs_eth       1
-#define prs_ipv4      2
-#define egress        29
+#define ingress             0   //pkt in
+#define egress              1   //pkt out
+#define ct                  2   //pkt ct
+#define acl                 3   //pkt acl
+#define nat                 4   //pkt nat
+#define prs_eth             10   //eth 802.x
+#define prs_ipv4            11   //ipv4
+#define prs_icmp            12   //icmp
+#define prs_tcp             13   //tcp
+#define prs_udp             14   //udp
 
 struct flow {
 	__be32  sip;
@@ -32,7 +39,7 @@ struct flow {
             bytes:16;
 } __packed;
 
-//xdp-0  进入XDP处理程序
+// 进入XDP处理程序
 /*
  * bpf_xdp_adjust_meta / bpf_xdp_adjust_tail / bpf_xdp_adjust_head
  * SourceCode: https://elixir.bootlin.com/linux/v5.4.153/source/net/core/filter.c#L3429
@@ -59,7 +66,6 @@ struct flow {
 */
 PROG(ingress)(struct xdp_md *ctx) {     
     
-    bpf_printk("enter prs ingress 1 %x %x %x", ctx->data_meta, ctx->data, sizeof(struct flow));
     // 封装flow
 	/* Reserve space in-front of data pointer for our meta info.
 	 * (Notice drivers not supporting data_meta will fail here!)
@@ -101,10 +107,8 @@ PROG(ingress)(struct xdp_md *ctx) {
     return XDP_PASS;
 }
 
-//xdp-29 离开XDP处理程序 
+// 离开XDP处理程序 
 PROG(egress)(struct xdp_md *ctx) {     
-
-    bpf_printk("enter prs egress 1 %x %x %x", ctx->data_meta, ctx->data, sizeof(struct flow));
 
     void *data      = (void *)(unsigned long)ctx->data;
     struct flow *f  = (void *)(unsigned long)ctx->data_meta;
@@ -117,14 +121,31 @@ PROG(egress)(struct xdp_md *ctx) {
     bpf_printk("sport=%x dport=%x", f->sport, f->dport);
     bpf_printk("proto=%x delta=%x bytes=%x", f->proto, f->delta, f->bytes);
 
-    bpf_printk("enter prs egress 2 %x %x %x", ctx->data_meta, ctx->data, sizeof(struct flow));
     return XDP_PASS;
 }
 
-//xdp-1  以太网报文处理程序
-PROG(prs_eth)(struct xdp_md *ctx) { 
+// 连接跟踪处理程序
+PROG(ct)(struct xdp_md *ctx) {     
 
-    bpf_printk("enter prs eth 1 %x %x %x", ctx->data_meta, ctx->data, sizeof(struct flow));
+    void *data      = (void *)(unsigned long)ctx->data;
+    struct flow *f  = (void *)(unsigned long)ctx->data_meta;
+
+    if ((char*)(f + 1) > (char*)data) {
+        return XDP_DROP;
+    }
+
+    // 五元组连接跟踪分析
+
+
+
+
+
+    bpf_tail_call(ctx, &jt, egress);
+    return XDP_PASS;
+}
+
+// 以太网报文处理程序
+PROG(prs_eth)(struct xdp_md *ctx) { 
 
     void *data      = (void *)(unsigned long)ctx->data;
     void *data_end  = (void *)(unsigned long)ctx->data_end;
@@ -156,10 +177,8 @@ PROG(prs_eth)(struct xdp_md *ctx) {
     return XDP_PASS;
 }
 
-//xdp-2 IPv4报文处理程序
+// IPv4报文处理程序
 PROG(prs_ipv4)(struct xdp_md *ctx) { 
-
-    bpf_printk("enter prs ipv4 1 %x %x %x", ctx->data_meta, ctx->data, sizeof(struct flow));
 
     void *data      = (void *)(unsigned long)ctx->data;
     void *data_end  = (void *)(unsigned long)ctx->data_end;
@@ -180,10 +199,118 @@ PROG(prs_ipv4)(struct xdp_md *ctx) {
     f->sip    = iph->saddr;
     f->dip    = iph->daddr;
     f->delta += nh_off;
+    f->proto  = iph->protocol;
+
+    //分片报文暂不支持
+    if (iph->frag_off & 0xff3f) {
+        return XDP_PASS;
+    }
+
+
+    switch (iph->protocol) {
+    case 0x06: //tcp
+        bpf_tail_call(ctx, &jt, prs_tcp);
+        break;
+
+    case 0x11: //udp
+        bpf_tail_call(ctx, &jt, prs_udp);
+        break;
+
+    case 0x01: //icmp
+        bpf_tail_call(ctx, &jt, prs_icmp);
+        break;
+    }
 
     bpf_tail_call(ctx, &jt, egress);
     return XDP_PASS;
 }
 
+// ICMP报文处理程序
+PROG(prs_icmp)(struct xdp_md *ctx) { 
+
+    bpf_printk("enter prs icmp 1 %x %x %x", ctx->data_meta, ctx->data, sizeof(struct flow));
+
+    void *data      = (void *)(unsigned long)ctx->data;
+    void *data_end  = (void *)(unsigned long)ctx->data_end;
+    struct flow *f  = (void *)(unsigned long)ctx->data_meta;
+
+    if ((char*)(f + 1) > (char*)data) {
+        return XDP_DROP;
+    }
+
+    struct icmphdr  *icmph = data + f->delta;
+    __u8   nh_off; 
+
+    nh_off = (char*)(icmph + 1) - (char*)icmph;
+    if (data + f->delta + nh_off > data_end) {
+        return XDP_DROP;
+    }
+
+    f->sport  = icmph->type;
+    f->dport  = icmph->code;
+    f->delta += nh_off;
+
+    bpf_tail_call(ctx, &jt, ct);
+    bpf_tail_call(ctx, &jt, egress);
+    return XDP_PASS;
+}
+
+// TCP报文处理程序
+PROG(prs_tcp)(struct xdp_md *ctx) { 
+
+    void *data      = (void *)(unsigned long)ctx->data;
+    void *data_end  = (void *)(unsigned long)ctx->data_end;
+    struct flow *f  = (void *)(unsigned long)ctx->data_meta;
+
+    if ((char*)(f + 1) > (char*)data) {
+        return XDP_DROP;
+    }
+
+    struct tcphdr *tcph = data + f->delta;
+    __u8   nh_off; 
+
+    nh_off = (char*)(tcph + 1) - (char*)tcph;
+    if (data + f->delta + nh_off > data_end) {
+        return XDP_DROP;
+    }
+
+    f->sport  = tcph->source;
+    f->dport  = tcph->dest;
+    f->delta += nh_off;
+
+    bpf_tail_call(ctx, &jt, ct);
+    bpf_tail_call(ctx, &jt, egress);
+    return XDP_PASS;
+}
+
+// UDP报文处理程序
+PROG(prs_udp) (struct xdp_md *ctx) { 
+
+    void *data      = (void *)(unsigned long)ctx->data;
+    void *data_end  = (void *)(unsigned long)ctx->data_end;
+    struct flow *f  = (void *)(unsigned long)ctx->data_meta;
+
+    if ((char*)(f + 1) > (char*)data) {
+        return XDP_DROP;
+    }
+
+    struct udphdr *udph = data + f->delta;
+    __u8   nh_off; 
+
+    nh_off = (char*)(udph + 1) - (char*)udph;
+    if (data + f->delta + nh_off > data_end) {
+        return XDP_DROP;
+    }
+
+    f->sport  = udph->source;
+    f->dport  = udph->dest;
+    f->delta += nh_off;
+
+    bpf_tail_call(ctx, &jt, ct);
+    bpf_tail_call(ctx, &jt, egress);
+    return XDP_PASS;
+}
 
 char _license []SEC("license") = "GPL";
+
+
