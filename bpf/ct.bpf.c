@@ -20,24 +20,74 @@ struct {
 
 #define ingress             0   //pkt in
 #define egress              1   //pkt out
-#define ct                  2   //pkt ct
-#define acl                 3   //pkt acl
-#define nat                 4   //pkt nat
-#define prs_eth             10   //eth 802.x
-#define prs_ipv4            11   //ipv4
-#define prs_icmp            12   //icmp
-#define prs_tcp             13   //tcp
-#define prs_udp             14   //udp
+#define prs_end             2   //prs end
+#define ct                  3   //pkt ct 
+#define acl                 4   //pkt ac l
+#define nat                 5   //pkt na t
+#define prs_eth             10  //eth 80 2.x
+#define prs_ipv4            11  //ipv4
+#define prs_icmp            12  //icmp
+#define prs_tcp             13  //tcp
+#define prs_udp             14  //udp
 
+/*
+ * flow 表示报文五元组; 用于构建ct的tuple;
+ * 
+ * flags:  8bit 注意每个bit的含义
+ *        7 6 5 4 3 2 1 0
+ *        ---------------
+ *                    | |
+ *                    | 表示报文方向 0表示入向 1表示出向
+ *                    |
+ *                    表示是否是related报文
+ *                  
+ *
+ */
 struct flow {
-	__be32  sip;
+    __be32  sip;
     __be32  dip;
     __be32  sport:16,
             dport:16;
     __u32   proto:8,
             delta:8,
             bytes:16;
-} __packed;
+    __u32   flags:8,       
+            reserved:24;
+} __attribute__((packed));
+
+////////////////////////////////////////
+#define ct_trk              0x01
+#define ct_new              0x02
+#define ct_est              0x04
+#define ct_rel              0x08
+#define ct_rpl              0x10
+#define ct_inv              0x20
+#define ct_snat             0x40
+#define ct_dnat             0x80
+
+struct ipv4_ct_tuple {
+    __be32  sip;
+    __be32  dip;
+    __be16  dport;
+	__be16  sport;
+	__u8	nexthdr;
+} __attribute__((packed));
+
+struct ipv4_ct_entry {
+    __u8    state;
+
+    struct  stat {
+        __u64 pkts;
+        __u64 bytes;
+    } ss[2];
+} __attribute__((packed));
+
+struct {
+   __uint(type,         BPF_MAP_TYPE_LRU_HASH);
+   __type(key,          struct ipv4_ct_tuple);
+   __type(value,        struct ipv4_ct_entry);
+   __uint(max_entries,  1024);
+} ctt SEC(".maps");      //conntrack table
 
 // 进入XDP处理程序
 /*
@@ -97,18 +147,65 @@ PROG(ingress)(struct xdp_md *ctx) {
     f->proto    = 0;
     f->delta    = 0;
     f->bytes    = data_end - data;
+    f->flags    = ingress;
+    f->reserved = 0;
 
     // 解析以太网报文
     bpf_tail_call(ctx, &jt, prs_eth);
 
     // 解封flow 
-    bpf_tail_call(ctx, &jt, egress);
+    bpf_tail_call(ctx, &jt, prs_end);
+
+    return XDP_PASS;
+}
+
+PROG(egress)(struct xdp_md *ctx) {     
+    
+    // 封装flow
+	/* Reserve space in-front of data pointer for our meta info.
+	 * (Notice drivers not supporting data_meta will fail here!)
+	 */
+    int r = bpf_xdp_adjust_meta(ctx, 0 - (int)sizeof(struct flow));
+    if (r) {
+        bpf_printk("bpf_xdp_adjust_meta errno = %x", r);
+        return XDP_DROP;
+    }
+
+	/* Notice: Kernel-side verifier requires that loading of
+	 * ctx->data MUST happen _after_ helper bpf_xdp_adjust_meta(),
+	 * as pkt-data pointers are invalidated.  Helpers that require
+	 * this are determined/marked by bpf_helper_changes_pkt_data()
+	 */
+    void *data      = (void *)(unsigned long)ctx->data;
+    void *data_end  = (void *)(unsigned long)ctx->data_end;
+    struct flow *f  = (void *)(unsigned long)ctx->data_meta;
+
+    if ((char*)(f + 1) > (char*)data) {
+        return XDP_DROP;
+    }
+
+    // 初始化Flow
+    f->sip      = 0;
+    f->dip      = 0;
+    f->sport    = 0;
+    f->dport    = 0;
+    f->proto    = 0;
+    f->delta    = 0;
+    f->bytes    = data_end - data;
+    f->flags    = egress;
+    f->reserved = 0;
+
+    // 解析以太网报文
+    bpf_tail_call(ctx, &jt, prs_eth);
+
+    // 解封flow 
+    bpf_tail_call(ctx, &jt, prs_end);
 
     return XDP_PASS;
 }
 
 // 离开XDP处理程序 
-PROG(egress)(struct xdp_md *ctx) {     
+PROG(prs_end)(struct xdp_md *ctx) {     
 
     void *data      = (void *)(unsigned long)ctx->data;
     struct flow *f  = (void *)(unsigned long)ctx->data_meta;
@@ -116,7 +213,7 @@ PROG(egress)(struct xdp_md *ctx) {
     if ((char*)(f + 1) > (char*)data) {
         return XDP_DROP;
     }
-
+    
     bpf_printk("sip=%x dip=%x", f->sip, f->dip);
     bpf_printk("sport=%x dport=%x", f->sport, f->dport);
     bpf_printk("proto=%x delta=%x bytes=%x", f->proto, f->delta, f->bytes);
@@ -135,12 +232,35 @@ PROG(ct)(struct xdp_md *ctx) {
     }
 
     // 五元组连接跟踪分析
+    struct ipv4_ct_tuple tuple = {}; 
+
+    tuple.sip     = f->sip;
+    tuple.dip     = f->dip;
+    tuple.dport   = f->dport;
+    tuple.sport   = f->sport;
+    tuple.nexthdr = f->proto;
+
+    // 查询CT表
+    struct ipv4_ct_entry *entry (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &tuple);
+    if (entry) {
+		__sync_fetch_and_add(&entry->ss[f->flags % 0x02].pkts, 1);
+		__sync_fetch_and_add(&entry->ss[f->flags % 0x02].bytes,f->bytes);
+    }
+
+    //struct ipv4_ct_entry entry = {};
+    //entry.state                     = f->flags & 0x02 ? ct_trk | ct_rel : ct_new;
+    //entry.ss[f->flags % 0x02].pkts  = 1;
+    //entry.ss[f->flags % 0x02].bytes = f->bytes;
+
+
+    // 查询CT表
 
 
 
 
 
-    bpf_tail_call(ctx, &jt, egress);
+
+    bpf_tail_call(ctx, &jt, prs_end);
     return XDP_PASS;
 }
 
@@ -173,7 +293,7 @@ PROG(prs_eth)(struct xdp_md *ctx) {
         break;
     }
     
-    bpf_tail_call(ctx, &jt, egress);
+    bpf_tail_call(ctx, &jt, prs_end);
     return XDP_PASS;
 }
 
@@ -221,7 +341,7 @@ PROG(prs_ipv4)(struct xdp_md *ctx) {
         break;
     }
 
-    bpf_tail_call(ctx, &jt, egress);
+    bpf_tail_call(ctx, &jt, prs_end);
     return XDP_PASS;
 }
 
@@ -246,12 +366,27 @@ PROG(prs_icmp)(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    f->sport  = icmph->type;
-    f->dport  = icmph->code;
+
+    switch (icmph->type) {
+    case ICMP_DEST_UNREACH:
+    case ICMP_TIME_EXCEEDED:
+    case ICMP_PARAMETERPROB:
+        f->flags |= 0x2;
+        break;
+
+    case ICMP_ECHOREPLY:
+        f->sport  = icmph->un.echo.id;
+        break;
+
+    case ICMP_ECHO:
+        f->dport  = icmph->un.echo.id;
+        break;
+    }
+
     f->delta += nh_off;
 
     bpf_tail_call(ctx, &jt, ct);
-    bpf_tail_call(ctx, &jt, egress);
+    bpf_tail_call(ctx, &jt, prs_end);
     return XDP_PASS;
 }
 
@@ -279,7 +414,7 @@ PROG(prs_tcp)(struct xdp_md *ctx) {
     f->delta += nh_off;
 
     bpf_tail_call(ctx, &jt, ct);
-    bpf_tail_call(ctx, &jt, egress);
+    bpf_tail_call(ctx, &jt, prs_end);
     return XDP_PASS;
 }
 
@@ -307,7 +442,7 @@ PROG(prs_udp) (struct xdp_md *ctx) {
     f->delta += nh_off;
 
     bpf_tail_call(ctx, &jt, ct);
-    bpf_tail_call(ctx, &jt, egress);
+    bpf_tail_call(ctx, &jt, prs_end);
     return XDP_PASS;
 }
 
