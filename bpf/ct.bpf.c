@@ -16,7 +16,8 @@ struct {
    __uint(max_entries,  30);
 } jt SEC(".maps");      //jump table
 
-#define PROG(F) SEC("xdp/"__stringify(F)) int bf_##F
+#define PROG(F)             SEC("xdp/"__stringify(F)) int bf_##F
+#define bpf_now()		    bpf_ktime_get_sec()
 
 #define ingress             0   //pkt in
 #define egress              1   //pkt out
@@ -36,12 +37,18 @@ struct {
  * flags:  8bit 注意每个bit的含义
  *        7 6 5 4 3 2 1 0
  *        ---------------
- *                    | |
- *                    | 表示报文方向 0表示入向 1表示出向
- *                    |
- *                    表示是否是related报文
- *                  
- *
+ *        | | | | | | | |
+ *        | | | | | | | 表示报文方向 0表示入向 1表示出向
+ *        | | | | | | |
+ *        | | | | | | 表示是否是related报文
+ *        | | | | |FIN           
+ *        | | | |SYN 
+ *        | | |RST
+ *        | |PSH
+ *        |ACK
+ *       URG
+ *       -------------
+ *            TCP
  */
 struct flow {
     __be32  sip;
@@ -51,36 +58,53 @@ struct flow {
     __u32   proto:8,
             delta:8,
             bytes:16;
-    __u32   flags:8,       
+    __u32   urg:1,       
+            ack:1,
+            psh:1,
+            rst:1,
+            syn:1,
+            fin:1,
+            rel:1,
+            dir:1,
             reserved:24;
 } __attribute__((packed));
 
 ////////////////////////////////////////
-#define ct_trk              0x01
-#define ct_new              0x02
+#define ct_new              0x01
+#define ct_rpl              0x02
 #define ct_est              0x04
 #define ct_rel              0x08
-#define ct_rpl              0x10
-#define ct_inv              0x20
-#define ct_snat             0x40
-#define ct_dnat             0x80
-
+/*
+ * ipv4_ct_tuple 表示ct状态表key
+ * 
+ * flags:  8bit 注意每个bit的含义
+ *        7 6 5 4 3 2 1 0
+ *        ---------------
+ *                    | |
+ *                    | 表示CT方向 0表示入向 1表示出向
+ *                    |
+ *                    表示是否是related报文
+ *                  
+ *
+ */
 struct ipv4_ct_tuple {
     __be32  sip;
     __be32  dip;
     __be16  dport;
 	__be16  sport;
 	__u8	nexthdr;
-} __attribute__((packed));
+    __u8    rel:1,
+            dir:1,
+            reserved:6;
+};
 
 struct ipv4_ct_entry {
-    __u8    state;
-
-    struct  stat {
-        __u64 pkts;
-        __u64 bytes;
-    } ss[2];
-} __attribute__((packed));
+    __u64   bytes;
+    __u64   pkts;
+    __u64   state:8,
+            ts:32,
+            reserved:24;
+};
 
 struct {
    __uint(type,         BPF_MAP_TYPE_LRU_HASH);
@@ -147,7 +171,14 @@ PROG(ingress)(struct xdp_md *ctx) {
     f->proto    = 0;
     f->delta    = 0;
     f->bytes    = data_end - data;
-    f->flags    = ingress;
+    f->urg      = 0;
+    f->ack      = 0;
+    f->psh      = 0;
+    f->rst      = 0;
+    f->syn      = 0;
+    f->fin      = 0;
+    f->rel      = 0;
+    f->dir      = ingress;
     f->reserved = 0;
 
     // 解析以太网报文
@@ -192,7 +223,14 @@ PROG(egress)(struct xdp_md *ctx) {
     f->proto    = 0;
     f->delta    = 0;
     f->bytes    = data_end - data;
-    f->flags    = egress;
+    f->urg      = 0;
+    f->ack      = 0;
+    f->psh      = 0;
+    f->rst      = 0;
+    f->syn      = 0;
+    f->fin      = 0;
+    f->rel      = 0;
+    f->dir      = egress;
     f->reserved = 0;
 
     // 解析以太网报文
@@ -200,23 +238,6 @@ PROG(egress)(struct xdp_md *ctx) {
 
     // 解封flow 
     bpf_tail_call(ctx, &jt, prs_end);
-
-    return XDP_PASS;
-}
-
-// 离开XDP处理程序 
-PROG(prs_end)(struct xdp_md *ctx) {     
-
-    void *data      = (void *)(unsigned long)ctx->data;
-    struct flow *f  = (void *)(unsigned long)ctx->data_meta;
-
-    if ((char*)(f + 1) > (char*)data) {
-        return XDP_DROP;
-    }
-    
-    bpf_printk("sip=%x dip=%x", f->sip, f->dip);
-    bpf_printk("sport=%x dport=%x", f->sport, f->dport);
-    bpf_printk("proto=%x delta=%x bytes=%x", f->proto, f->delta, f->bytes);
 
     return XDP_PASS;
 }
@@ -232,33 +253,89 @@ PROG(ct)(struct xdp_md *ctx) {
     }
 
     // 五元组连接跟踪分析
-    struct ipv4_ct_tuple tuple = {}; 
+    struct ipv4_ct_tuple tuple  = {}; 
+    struct ipv4_ct_tuple rtuple = {}; 
+    
+    tuple.sip       = f->sip;       rtuple.sip      = f->dip;
+    tuple.dip       = f->dip;       rtuple.dip      = f->sip;
+    tuple.dport     = f->dport;     rtuple.dport    = f->sport;
+    tuple.sport     = f->sport;     rtuple.sport    = f->dport;
+    tuple.nexthdr   = f->proto;     rtuple.nexthdr  = f->proto;
+    tuple.rel       = f->rel;       rtuple.rel      = f->rel;
+    tuple.dir       = f->dir;       rtuple.dir      = ~f->dir;
+    tuple.reserved  = 0;            rtuple.reserved = 0;
 
-    tuple.sip     = f->sip;
-    tuple.dip     = f->dip;
-    tuple.dport   = f->dport;
-    tuple.sport   = f->sport;
-    tuple.nexthdr = f->proto;
+    // 处理related 报文
+    struct ipv4_ct_entry *rentry = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &rtuple);
+    struct ipv4_ct_entry *entry  = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &tuple);
 
-    // 查询CT表
-    struct ipv4_ct_entry *entry (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &tuple);
-    if (entry) {
-		__sync_fetch_and_add(&entry->ss[f->flags % 0x02].pkts, 1);
-		__sync_fetch_and_add(&entry->ss[f->flags % 0x02].bytes,f->bytes);
+    if (entry && rentry) {
+
+        switch (rentry->state) {
+        case ct_new:
+            {
+                switch(entry->state) {
+                case ct_new:
+                    entry->state |= ct_rpl;
+                    break;
+                }
+            }
+            break;
+
+        case ct_rpl|ct_new:
+            {
+                switch(entry->state) {
+                case ct_new:
+                    entry->state |= ct_rpl;
+                    break;
+
+                case ct_rpl|ct_new:
+                    entry->state |= ct_est;
+                    break;
+                }
+            }
+            break;
+
+        case ct_est|ct_rpl|ct_new:
+            {
+                switch(entry->state) {
+                case ct_rpl|ct_new:
+                    entry->state |= ct_est;
+                    break;
+                }
+            }
+            break;
+        }
+
+        __sync_fetch_and_add(&entry->pkts, 1);
+        __sync_fetch_and_add(&entry->bytes,f->bytes);
+
+        entry->ts = bpf_now();
+
+        bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+    } 
+
+    if (!entry) {
+        struct ipv4_ct_entry tentry  = {};
+        entry  = &tentry;
+        entry->state = ct_new;
+        entry->pkts  = 1;
+        entry->bytes = f->bytes;
+        entry->ts    = bpf_now();
+
+        bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
     }
 
-    //struct ipv4_ct_entry entry = {};
-    //entry.state                     = f->flags & 0x02 ? ct_trk | ct_rel : ct_new;
-    //entry.ss[f->flags % 0x02].pkts  = 1;
-    //entry.ss[f->flags % 0x02].bytes = f->bytes;
+    if (!rentry) {
+        struct ipv4_ct_entry trentry = {};
+        rentry = &trentry;
+        entry->state = ct_new;
+        entry->pkts  = 0;
+        entry->bytes = 0;
+        entry->ts    = bpf_now();
 
-
-    // 查询CT表
-
-
-
-
-
+        bpf_map_update_elem(&ctt, &rtuple, rentry, BPF_ANY);
+    }
 
     bpf_tail_call(ctx, &jt, prs_end);
     return XDP_PASS;
@@ -371,7 +448,7 @@ PROG(prs_icmp)(struct xdp_md *ctx) {
     case ICMP_DEST_UNREACH:
     case ICMP_TIME_EXCEEDED:
     case ICMP_PARAMETERPROB:
-        f->flags |= 0x2;
+        f->rel = 1;
         break;
 
     case ICMP_ECHOREPLY:
@@ -412,6 +489,12 @@ PROG(prs_tcp)(struct xdp_md *ctx) {
     f->sport  = tcph->source;
     f->dport  = tcph->dest;
     f->delta += nh_off;
+    f->urg    = tcph->urg;
+    f->ack    = tcph->ack;
+    f->psh    = tcph->psh;
+    f->rst    = tcph->rst;
+    f->syn    = tcph->syn;
+    f->fin    = tcph->fin;
 
     bpf_tail_call(ctx, &jt, ct);
     bpf_tail_call(ctx, &jt, prs_end);
@@ -443,6 +526,19 @@ PROG(prs_udp) (struct xdp_md *ctx) {
 
     bpf_tail_call(ctx, &jt, ct);
     bpf_tail_call(ctx, &jt, prs_end);
+    return XDP_PASS;
+}
+
+// 离开XDP处理程序 
+PROG(prs_end)(struct xdp_md *ctx) {     
+
+    void *data      = (void *)(unsigned long)ctx->data;
+    struct flow *f  = (void *)(unsigned long)ctx->data_meta;
+
+    if ((char*)(f + 1) > (char*)data) {
+        return XDP_DROP;
+    }
+
     return XDP_PASS;
 }
 
