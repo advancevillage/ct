@@ -9,6 +9,16 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+
+/*
+ * u64 bpf_ktime_get_ns(void) 
+ *
+ * https://github.com/cilium/cilium/blob/master/bpf/lib/time.h
+ */
+#define NSEC_PER_SEC	        (1000ULL * 1000ULL * 1000UL)
+#define bpf_ktime_get_sec()	    ({ __u64 __x = bpf_ktime_get_ns() / NSEC_PER_SEC; __x; })
+#define bpf_now()		        bpf_ktime_get_sec()
+
 struct {
    __uint(type,         BPF_MAP_TYPE_PROG_ARRAY);
    __type(key,          0x04);
@@ -17,7 +27,6 @@ struct {
 } jt SEC(".maps");      //jump table
 
 #define PROG(F)             SEC("xdp/"__stringify(F)) int bf_##F
-#define bpf_now()		    bpf_ktime_get_sec()
 
 #define ingress             0   //pkt in
 #define egress              1   //pkt out
@@ -85,7 +94,9 @@ struct flow {
  *                    |
  *                    表示是否是related报文
  *                  
- *
+ * ipv4_ct_entry 表示ct表项
+ * 
+ * since 从系统启动开始计时
  */
 struct ipv4_ct_tuple {
     __be32  sip;
@@ -102,7 +113,7 @@ struct ipv4_ct_entry {
     __u64   bytes;
     __u64   pkts;
     __u64   state:8,
-            ts:32,
+            since:32,
             reserved:24;
 };
 
@@ -310,18 +321,75 @@ PROG(ct)(struct xdp_md *ctx) {
         __sync_fetch_and_add(&entry->pkts, 1);
         __sync_fetch_and_add(&entry->bytes,f->bytes);
 
-        entry->ts = bpf_now();
+        entry->since = bpf_now();
 
         bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
     } 
 
     if (!entry) {
+    
+        switch (tuple.nexthdr) {
+        case 0x11:
+            {
+                struct ipv4_ct_tuple reltuple  = {}; 
+                
+                reltuple.sip       = f->sip;       
+                reltuple.dip       = f->dip;       
+                reltuple.dport     = 0;            
+                reltuple.sport     = 0;            
+                reltuple.nexthdr   = 0x01;         
+                reltuple.rel       = 1;            
+                reltuple.dir       = f->dir;       
+                reltuple.reserved  = 0;                           
+
+                struct ipv4_ct_entry relentry  = {};
+                relentry.state  = ct_rel;
+                relentry.pkts   = 0;
+                relentry.bytes  = 0;
+                relentry.since  = bpf_now();
+
+                bpf_map_update_elem(&ctt, &reltuple, &relentry, BPF_ANY);
+            }
+            break;
+
+        }
+    }
+
+    if (!rentry) {
+
+        switch (tuple.nexthdr) {
+        case 0x11:
+            {
+                struct ipv4_ct_tuple relrtuple = {}; 
+                
+                relrtuple.sip      = f->dip;
+                relrtuple.dip      = f->sip;
+                relrtuple.dport    = 0;
+                relrtuple.sport    = 0;
+                relrtuple.nexthdr  = 0x01;
+                relrtuple.rel      = 1;
+                relrtuple.dir      = ~f->dir;
+                relrtuple.reserved = 0;
+                
+                struct ipv4_ct_entry relrentry  = {};
+                relrentry.state  = ct_rel;
+                relrentry.pkts   = 0;
+                relrentry.bytes  = 0;
+                relrentry.since  = bpf_now();
+
+                bpf_map_update_elem(&ctt, &relrtuple, &relrentry, BPF_ANY);
+            }
+            break;
+        }
+    }
+
+    if (!entry) {
         struct ipv4_ct_entry tentry  = {};
         entry  = &tentry;
-        entry->state = ct_new;
-        entry->pkts  = 1;
-        entry->bytes = f->bytes;
-        entry->ts    = bpf_now();
+        entry->state  = ct_new;
+        entry->pkts   = 1;
+        entry->bytes  = f->bytes;
+        entry->since  = bpf_now();
 
         bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
     }
@@ -332,7 +400,7 @@ PROG(ct)(struct xdp_md *ctx) {
         entry->state = ct_new;
         entry->pkts  = 0;
         entry->bytes = 0;
-        entry->ts    = bpf_now();
+        entry->since = bpf_now();
 
         bpf_map_update_elem(&ctt, &rtuple, rentry, BPF_ANY);
     }
@@ -424,8 +492,6 @@ PROG(prs_ipv4)(struct xdp_md *ctx) {
 
 // ICMP报文处理程序
 PROG(prs_icmp)(struct xdp_md *ctx) { 
-
-    bpf_printk("enter prs icmp 1 %x %x %x", ctx->data_meta, ctx->data, sizeof(struct flow));
 
     void *data      = (void *)(unsigned long)ctx->data;
     void *data_end  = (void *)(unsigned long)ctx->data_end;
