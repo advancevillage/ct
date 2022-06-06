@@ -99,11 +99,11 @@ struct flow {
  * since 从系统启动开始计时
  */
 struct ipv4_ct_tuple {
-    __be32  sip;
-    __be32  dip;
-    __be16  dport;
-	__be16  sport;
-	__u8	nexthdr;
+    __u32   sip;
+    __u32   dip;
+	__u16   sport;
+    __u16   dport;
+	__u8    nexthdr;
     __u8    rel:1,
             dir:1,
             reserved:6;
@@ -477,8 +477,8 @@ PROG(prs_ipv4)(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    f->sip    = iph->saddr;
-    f->dip    = iph->daddr;
+    f->sip    = bpf_ntohl(iph->saddr);
+    f->dip    = bpf_ntohl(iph->daddr);
     f->delta += nh_off;
     f->proto  = iph->protocol;
 
@@ -536,11 +536,11 @@ PROG(prs_icmp)(struct xdp_md *ctx) {
         break;
 
     case ICMP_ECHOREPLY:
-        f->sport  = icmph->un.echo.id;
+        f->sport  = bpf_ntohs(icmph->un.echo.id);
         break;
 
     case ICMP_ECHO:
-        f->dport  = icmph->un.echo.id;
+        f->dport  = bpf_ntohs(icmph->un.echo.id);
         break;
     }
 
@@ -569,8 +569,8 @@ PROG(prs_tcp)(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    f->sport  = tcph->source;
-    f->dport  = tcph->dest;
+    f->sport  = bpf_ntohs(tcph->source);
+    f->dport  = bpf_ntohs(tcph->dest);
     f->delta += nh_off;
     f->urg    = tcph->urg;
     f->ack    = tcph->ack;
@@ -603,8 +603,8 @@ PROG(prs_udp) (struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    f->sport  = udph->source;
-    f->dport  = udph->dest;
+    f->sport  = bpf_ntohs(udph->source);
+    f->dport  = bpf_ntohs(udph->dest);
     f->delta += nh_off;
 
     bpf_tail_call(ctx, &jt, ct);
