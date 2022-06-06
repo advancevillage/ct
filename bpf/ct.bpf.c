@@ -124,6 +124,152 @@ struct {
    __uint(max_entries,  1024);
 } ctt SEC(".maps");      //conntrack table
 
+static __inline __u8 ct_state(struct ipv4_ct_entry *rentry, struct ipv4_ct_entry *entry) {
+    __u8 next = ct_new; 
+
+    if (!entry || !rentry) {
+        return next;
+    }
+
+    switch (rentry->state & (~ct_rel)) {
+        case ct_new:
+            {
+                switch(entry->state) {
+                case ct_new:
+                    next = ct_rpl;
+                    break;
+                }
+            }
+            break;
+
+        case ct_rpl|ct_new:
+            {
+                switch(entry->state) {
+                case ct_new:
+                    next = ct_rpl;
+                    break;
+
+                case ct_rpl|ct_new:
+                    next = ct_est;
+                    break;
+                }
+            }
+            break;
+
+        case ct_est|ct_rpl|ct_new:
+            {
+                switch(entry->state) {
+                case ct_rpl|ct_new:
+                    next = ct_est;
+                    break;
+                }
+            }
+            break;
+        }
+
+    return next;
+}
+
+static __inline void ct_udp(struct flow *f) {
+    struct ipv4_ct_tuple tuple  = {}; 
+    struct ipv4_ct_tuple rtuple = {}; 
+    
+    tuple.sip       = f->sip;       rtuple.sip      = f->dip;
+    tuple.dip       = f->dip;       rtuple.dip      = f->sip;
+    tuple.dport     = f->dport;     rtuple.dport    = f->sport;
+    tuple.sport     = f->sport;     rtuple.sport    = f->dport;
+    tuple.nexthdr   = f->proto;     rtuple.nexthdr  = f->proto;
+    tuple.rel       = f->rel;       rtuple.rel      = f->rel;
+    tuple.dir       = f->dir;       rtuple.dir      = ~f->dir;
+    tuple.reserved  = 0;            rtuple.reserved = 0;
+
+    struct ipv4_ct_entry *rentry = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &rtuple);
+    struct ipv4_ct_entry *entry  = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &tuple);
+
+    if(entry && rentry) {
+        entry->since = bpf_now();
+        entry->state |= ct_state(rentry, entry);
+        __sync_fetch_and_add(&entry->pkts, 1);
+        __sync_fetch_and_add(&entry->bytes,f->bytes);
+        bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+    }
+    
+    if(!entry) {
+       struct ipv4_ct_entry tentry  = {};
+       entry  = &tentry;
+       entry->state  = tuple.rel ? ct_rel : ct_new;
+       entry->pkts   = 1;
+       entry->bytes  = f->bytes;
+       entry->since  = bpf_now();
+       bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+
+       tuple.rel    = ~tuple.rel;
+       entry->state = tuple.rel ? ct_rel : ct_new;
+       entry->pkts  = 0;
+       entry->bytes = 0;
+       bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+    }
+
+    if (!rentry) {
+       struct ipv4_ct_entry trentry = {};
+       rentry = &trentry;
+       rentry->state  = rtuple.rel ? ct_rel : ct_new;
+       rentry->pkts   = 0;
+       rentry->bytes  = 0;
+       rentry->since  = bpf_now();
+       bpf_map_update_elem(&ctt, &rtuple, rentry, BPF_ANY);
+
+       rtuple.rel    = ~rtuple.rel;
+       rentry->state = rtuple.rel ? ct_rel : ct_new;
+       bpf_map_update_elem(&ctt, &rtuple, rentry, BPF_ANY);
+    }
+}
+
+static __inline void ct_icmp(struct flow *f) {
+    struct ipv4_ct_tuple tuple  = {}; 
+    struct ipv4_ct_tuple rtuple = {}; 
+    
+    tuple.sip       = f->sip;       rtuple.sip      = f->dip;
+    tuple.dip       = f->dip;       rtuple.dip      = f->sip;
+    tuple.dport     = f->dport;     rtuple.dport    = f->sport;
+    tuple.sport     = f->sport;     rtuple.sport    = f->dport;
+    tuple.nexthdr   = f->proto;     rtuple.nexthdr  = f->proto;
+    tuple.rel       = f->rel;       rtuple.rel      = f->rel;
+    tuple.dir       = f->dir;       rtuple.dir      = ~f->dir;
+    tuple.reserved  = 0;            rtuple.reserved = 0;
+
+    struct ipv4_ct_entry *rentry = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &rtuple);
+    struct ipv4_ct_entry *entry  = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &tuple);
+
+    if(entry && rentry) {
+        entry->since = bpf_now();
+        entry->state |= ct_state(rentry, entry);
+        __sync_fetch_and_add(&entry->pkts, 1);
+        __sync_fetch_and_add(&entry->bytes,f->bytes);
+        bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+    }
+
+    if(!entry) {
+       struct ipv4_ct_entry tentry  = {};
+       entry  = &tentry;
+       entry->state  = tuple.rel ? ct_rel : ct_new;
+       entry->pkts   = 1;
+       entry->bytes  = f->bytes;
+       entry->since  = bpf_now();
+       bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+    }
+
+    if (!rentry) {
+       struct ipv4_ct_entry trentry = {};
+       rentry = &trentry;
+       rentry->state  = rtuple.rel ? ct_rel : ct_new;
+       rentry->pkts   = 0;
+       rentry->bytes  = 0;
+       rentry->since  = bpf_now();
+       bpf_map_update_elem(&ctt, &rtuple, rentry, BPF_ANY);
+    }
+}
+
 // 进入XDP处理程序
 /*
  * bpf_xdp_adjust_meta / bpf_xdp_adjust_tail / bpf_xdp_adjust_head
@@ -263,146 +409,16 @@ PROG(ct)(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // 五元组连接跟踪分析
-    struct ipv4_ct_tuple tuple  = {}; 
-    struct ipv4_ct_tuple rtuple = {}; 
+    switch (f->proto) {
     
-    tuple.sip       = f->sip;       rtuple.sip      = f->dip;
-    tuple.dip       = f->dip;       rtuple.dip      = f->sip;
-    tuple.dport     = f->dport;     rtuple.dport    = f->sport;
-    tuple.sport     = f->sport;     rtuple.sport    = f->dport;
-    tuple.nexthdr   = f->proto;     rtuple.nexthdr  = f->proto;
-    tuple.rel       = f->rel;       rtuple.rel      = f->rel;
-    tuple.dir       = f->dir;       rtuple.dir      = ~f->dir;
-    tuple.reserved  = 0;            rtuple.reserved = 0;
+    case 0x11:
+        ct_udp(f);
+        break;
 
-    // 处理related 报文
-    struct ipv4_ct_entry *rentry = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &rtuple);
-    struct ipv4_ct_entry *entry  = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &tuple);
+    case 0x01:
+        ct_icmp(f);
+        break;
 
-    if (entry && rentry) {
-
-        switch (rentry->state) {
-        case ct_new:
-            {
-                switch(entry->state) {
-                case ct_new:
-                    entry->state |= ct_rpl;
-                    break;
-                }
-            }
-            break;
-
-        case ct_rpl|ct_new:
-            {
-                switch(entry->state) {
-                case ct_new:
-                    entry->state |= ct_rpl;
-                    break;
-
-                case ct_rpl|ct_new:
-                    entry->state |= ct_est;
-                    break;
-                }
-            }
-            break;
-
-        case ct_est|ct_rpl|ct_new:
-            {
-                switch(entry->state) {
-                case ct_rpl|ct_new:
-                    entry->state |= ct_est;
-                    break;
-                }
-            }
-            break;
-        }
-
-        __sync_fetch_and_add(&entry->pkts, 1);
-        __sync_fetch_and_add(&entry->bytes,f->bytes);
-
-        entry->since = bpf_now();
-
-        bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
-    } 
-
-    if (!entry) {
-    
-        switch (tuple.nexthdr) {
-        case 0x11:
-            {
-                struct ipv4_ct_tuple reltuple  = {}; 
-                
-                reltuple.sip       = f->sip;       
-                reltuple.dip       = f->dip;       
-                reltuple.dport     = 0;            
-                reltuple.sport     = 0;            
-                reltuple.nexthdr   = 0x01;         
-                reltuple.rel       = 1;            
-                reltuple.dir       = f->dir;       
-                reltuple.reserved  = 0;                           
-
-                struct ipv4_ct_entry relentry  = {};
-                relentry.state  = ct_rel;
-                relentry.pkts   = 0;
-                relentry.bytes  = 0;
-                relentry.since  = bpf_now();
-
-                bpf_map_update_elem(&ctt, &reltuple, &relentry, BPF_ANY);
-            }
-            break;
-
-        }
-    }
-
-    if (!rentry) {
-
-        switch (tuple.nexthdr) {
-        case 0x11:
-            {
-                struct ipv4_ct_tuple relrtuple = {}; 
-                
-                relrtuple.sip      = f->dip;
-                relrtuple.dip      = f->sip;
-                relrtuple.dport    = 0;
-                relrtuple.sport    = 0;
-                relrtuple.nexthdr  = 0x01;
-                relrtuple.rel      = 1;
-                relrtuple.dir      = ~f->dir;
-                relrtuple.reserved = 0;
-                
-                struct ipv4_ct_entry relrentry  = {};
-                relrentry.state  = ct_rel;
-                relrentry.pkts   = 0;
-                relrentry.bytes  = 0;
-                relrentry.since  = bpf_now();
-
-                bpf_map_update_elem(&ctt, &relrtuple, &relrentry, BPF_ANY);
-            }
-            break;
-        }
-    }
-
-    if (!entry) {
-        struct ipv4_ct_entry tentry  = {};
-        entry  = &tentry;
-        entry->state  = ct_new;
-        entry->pkts   = 1;
-        entry->bytes  = f->bytes;
-        entry->since  = bpf_now();
-
-        bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
-    }
-
-    if (!rentry) {
-        struct ipv4_ct_entry trentry = {};
-        rentry = &trentry;
-        entry->state = ct_new;
-        entry->pkts  = 0;
-        entry->bytes = 0;
-        entry->since = bpf_now();
-
-        bpf_map_update_elem(&ctt, &rtuple, rentry, BPF_ANY);
     }
 
     bpf_tail_call(ctx, &jt, prs_end);
@@ -509,12 +525,14 @@ PROG(prs_icmp)(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
+    f->delta += nh_off;
 
     switch (icmph->type) {
     case ICMP_DEST_UNREACH:
     case ICMP_TIME_EXCEEDED:
     case ICMP_PARAMETERPROB:
         f->rel = 1;
+        bpf_tail_call(ctx, &jt, prs_ipv4);
         break;
 
     case ICMP_ECHOREPLY:
@@ -526,9 +544,8 @@ PROG(prs_icmp)(struct xdp_md *ctx) {
         break;
     }
 
-    f->delta += nh_off;
-
     bpf_tail_call(ctx, &jt, ct);
+
     bpf_tail_call(ctx, &jt, prs_end);
     return XDP_PASS;
 }
