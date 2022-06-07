@@ -532,6 +532,7 @@ PROG(prs_icmp)(struct xdp_md *ctx) {
     case ICMP_TIME_EXCEEDED:
     case ICMP_PARAMETERPROB:
         f->rel = 1;
+        f->dir = ~f->dir;
         bpf_tail_call(ctx, &jt, prs_ipv4);
         break;
 
