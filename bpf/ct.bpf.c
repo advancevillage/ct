@@ -83,6 +83,12 @@ struct flow {
 #define ct_rpl              0x02
 #define ct_est              0x04
 #define ct_rel              0x08
+#define ct_syn_sent         0x10
+#define ct_syn_recv         0x20
+#define ct_fin_wait         0x40
+#define ct_close_wait       0x80
+#define ct_last_ack         0x100
+#define ct_time_wait        0x200
 /*
  * ipv4_ct_tuple 表示ct状态表key
  * 
@@ -112,9 +118,9 @@ struct ipv4_ct_tuple {
 struct ipv4_ct_entry {
     __u64   bytes;
     __u64   pkts;
-    __u64   state:8,
+    __u64   state:16,
             since:32,
-            reserved:24;
+            reserved:16;
 };
 
 struct {
@@ -124,8 +130,141 @@ struct {
    __uint(max_entries,  1024);
 } ctt SEC(".maps");      //conntrack table
 
-static __inline __u8 ct_state(struct ipv4_ct_entry *rentry, struct ipv4_ct_entry *entry) {
-    __u8 next = ct_new; 
+static __inline __u16 ct_tcp_state(struct ipv4_ct_entry *rentry, struct ipv4_ct_entry *entry, struct flow *f) {
+    __u16 next = ct_new; 
+
+    if (!entry || !rentry) {
+        return next;
+    }
+    
+    switch (rentry->state) {
+        case ct_new:
+            {
+                switch (entry->state) {
+                    case ct_new:
+                        {
+                            if (f->ack && f->syn) {
+                                next = ct_syn_recv; 
+                            } else if (f->syn) {
+                                next = ct_syn_sent;
+                            }
+                        }
+                        break;
+                }
+            }
+            break;
+
+        case ct_syn_sent|ct_new:
+            {
+                switch (entry->state) {
+                    case ct_new: 
+                        {
+                            if(f->ack && f->syn) {
+                                next = ct_syn_recv;
+                            }
+                        }
+                        break;
+                    case ct_syn_recv|ct_new:
+                        {
+                            if(f->ack && !f->syn) {
+                                next = ct_est;
+                            }
+                        }
+                        break;
+                }
+            }
+            break;
+
+        case ct_syn_recv|ct_new:
+            {
+                switch (entry->state) {
+                    case ct_syn_sent|ct_new:
+                        {
+                            if(f->ack && !f->syn) {
+                                next = ct_est;
+                            }
+                        }
+                        break;
+                }
+            }
+            break;
+
+        case ct_syn_sent|ct_est|ct_new:
+            {
+               switch (entry->state) {
+                    case ct_syn_recv|ct_new:
+                        {
+                            if (f->ack && !f->syn) {
+                                next = ct_est;
+                            }
+                        }
+                        break;
+                    case ct_syn_recv|ct_est|ct_new:
+                        {
+                            if (f->fin) {
+                                next = ct_close_wait;
+                            }
+                        }
+                        break;
+               }
+            }
+            break;
+
+        case ct_syn_recv|ct_est|ct_new:
+            {
+                switch (entry->state) {
+                    case ct_syn_sent|ct_est|ct_new: 
+                        {
+                            if (f->fin) {
+                                next = ct_fin_wait;
+                            }
+                        }
+                        break;
+                }
+            }
+            break;
+
+        case ct_fin_wait|ct_syn_sent|ct_est|ct_new:
+            {
+                switch(entry->state) {
+                    case ct_syn_recv|ct_est|ct_new: 
+                        {
+                            if(f->ack) {
+                                next = ct_close_wait;
+                            }
+                        }
+                        break;
+                    case ct_close_wait|ct_syn_recv|ct_est|ct_new:
+                        {
+                            if(f->fin) {
+                                next = ct_last_ack; 
+                            }
+                        }
+                        break;
+                }
+            }
+            break;
+
+        case ct_last_ack|ct_close_wait|ct_syn_recv|ct_est|ct_new:
+            {
+                switch(entry->state) {
+                    case ct_fin_wait|ct_syn_sent|ct_est|ct_new:
+                        {
+                            if(f->ack) {
+                                next = ct_time_wait;
+                            }
+                        }
+                        break;
+                }
+            }
+            break;
+    }
+
+    return next;
+}
+
+static __inline __u16 ct_state(struct ipv4_ct_entry *rentry, struct ipv4_ct_entry *entry) {
+    __u16 next = ct_new; 
 
     if (!entry || !rentry) {
         return next;
@@ -168,6 +307,51 @@ static __inline __u8 ct_state(struct ipv4_ct_entry *rentry, struct ipv4_ct_entry
         }
 
     return next;
+}
+
+static __inline void ct_tcp(struct flow *f) {
+    struct ipv4_ct_tuple tuple  = {}; 
+    struct ipv4_ct_tuple rtuple = {}; 
+    
+    tuple.sip       = f->sip;       rtuple.sip      = f->dip;
+    tuple.dip       = f->dip;       rtuple.dip      = f->sip;
+    tuple.dport     = f->dport;     rtuple.dport    = f->sport;
+    tuple.sport     = f->sport;     rtuple.sport    = f->dport;
+    tuple.nexthdr   = f->proto;     rtuple.nexthdr  = f->proto;
+    tuple.rel       = f->rel;       rtuple.rel      = f->rel;
+    tuple.dir       = f->dir;       rtuple.dir      = ~f->dir;
+    tuple.reserved  = 0;            rtuple.reserved = 0;
+
+    struct ipv4_ct_entry *rentry = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &rtuple);
+    struct ipv4_ct_entry *entry  = (struct ipv4_ct_entry*)bpf_map_lookup_elem(&ctt, &tuple);
+
+    if(!entry) {
+       struct ipv4_ct_entry tentry  = {};
+       entry  = &tentry;
+       entry->state  = ct_new;
+       entry->pkts   = 1;
+       entry->bytes  = f->bytes;
+       entry->since  = bpf_now();
+       bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+    }
+
+    if (!rentry) {
+       struct ipv4_ct_entry trentry = {};
+       rentry = &trentry;
+       rentry->state  = ct_new;
+       rentry->pkts   = 0;
+       rentry->bytes  = 0;
+       rentry->since  = bpf_now();
+       bpf_map_update_elem(&ctt, &rtuple, rentry, BPF_ANY);
+    }
+
+    if(entry && rentry) {
+        entry->since = bpf_now();
+        entry->state |= ct_tcp_state(rentry, entry, f);
+        __sync_fetch_and_add(&entry->pkts, 1);
+        __sync_fetch_and_add(&entry->bytes,f->bytes);
+        bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+    }
 }
 
 static __inline void ct_udp(struct flow *f) {
@@ -410,6 +594,10 @@ PROG(ct)(struct xdp_md *ctx) {
     }
 
     switch (f->proto) {
+
+    case 0x06:
+        ct_tcp(f);
+        break;
     
     case 0x11:
         ct_udp(f);
