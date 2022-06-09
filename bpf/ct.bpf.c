@@ -229,7 +229,9 @@ static __inline __u16 ct_tcp_state(struct ipv4_ct_entry *rentry, struct ipv4_ct_
                 switch(entry->state) {
                     case ct_syn_recv|ct_est|ct_new: 
                         {
-                            if(f->ack) {
+                            if(f->fin && f->ack) {
+                                next = ct_last_ack| ct_close_wait;
+                            }if(!f->fin && f->ack) {
                                 next = ct_close_wait;
                             }
                         }
@@ -351,6 +353,11 @@ static __inline void ct_tcp(struct flow *f) {
         __sync_fetch_and_add(&entry->pkts, 1);
         __sync_fetch_and_add(&entry->bytes,f->bytes);
         bpf_map_update_elem(&ctt, &tuple, entry, BPF_ANY);
+    }
+
+    if(f->rst) {
+        bpf_map_delete_elem(&ctt, &tuple);
+        bpf_map_delete_elem(&ctt, &rtuple);
     }
 }
 

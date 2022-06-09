@@ -50,3 +50,7 @@ clean=(map prog)
 for i in ${clean[@]}; do ls -h /sys/fs/bpf/$i/ | xargs -I {} sudo unlink /sys/fs/bpf/$i/{}; done
 
 ```
+```shell
+bpftool -j -p map dump pinned /sys/fs/bpf/map/ctt | grep key | awk -F '[' '{print $2}' | sed -e 's/"//g' -e 's/,/ /g' -e 's/^/bpftool map delete pinned \/sys\/fs\/bpf\/map\/ctt key hex /g'
+
+```
