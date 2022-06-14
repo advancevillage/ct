@@ -83,16 +83,37 @@ struct flow {
 } __attribute__((packed));
 
 ////////////////////////////////////////
-#define ct_new              0x01
-#define ct_rpl              0x02
-#define ct_est              0x04
-#define ct_rel              0x08
-#define ct_syn_sent         0x10
-#define ct_syn_recv         0x20
-#define ct_fin_wait         0x40
-#define ct_close_wait       0x80
-#define ct_last_ack         0x100
-#define ct_time_wait        0x200
+//  15 14 13 12 11 10 09 08 07 06 05 04 03 02 01 00
+//  -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+//  |  |  |  |  |  |                  |  |  |  |  |
+//  |  |  |  |  |  |                  |  |  |  |  |
+//  |  |  |  |  |  |                  |  |  |  |  0x0001 ct_new 
+//  |  |  |  |  |  |                  |  |  |  0x0002 ct_rel
+//  |  |  |  |  |  |                  |  |  0x0004 ct_rpl
+//  |  |  |  |  |  |                  |  0x0008 ct_syn_sent
+//  |  |  |  |  |  |                  0x0010 ct_syn_recv                             
+//  |  |  |  |  |  |                                                   
+//  |  |  |  |  |  |                                                 
+//  |  |  |  |  |  |                                                 
+//  |  |  |  |  | 0x0400 ct_est                                                 
+//  |  |  |  | 0x0800 ct_fin_wait                                                    
+//  |  |  | 0x1000 ct_last_ack                                                        
+//  |  | 0x2000 ct_last_ack                                                           
+//  | 0x4000 ct_time_wait                                                              
+//                                                                    
+
+#define ct_null             0x0000
+#define ct_new              0x0001
+#define ct_rel              0x0002
+#define ct_rpl              0x0004
+#define ct_syn_sent         0x0008
+#define ct_syn_recv         0x0010
+#define ct_est              0x0400
+#define ct_fin_wait         0x0800
+#define ct_close_wait       0x1000
+#define ct_last_ack         0x2000
+#define ct_time_wait        0x4000
+
 /*
  * ipv4_ct_tuple 表示ct状态表key
  * 

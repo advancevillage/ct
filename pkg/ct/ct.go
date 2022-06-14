@@ -3,6 +3,7 @@ package ct
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -67,6 +68,53 @@ type tuple struct {
 	Reserved    uint8  `json:"ireserved"`
 }
 
+type match struct {
+	Nexthdr uint8
+	Sip     uint32
+	Dip     uint32
+	Sport   uint16
+	Dport   uint16
+}
+
+type stat struct {
+	Bytes uint64
+	Pkts  uint64
+}
+
+// ct state:
+const (
+	ct_null       = 0x0000
+	ct_new        = 0x0001
+	ct_rpl        = 0x0002
+	ct_syn_sent   = 0x0004
+	ct_syn_recv   = 0x0008
+	ct_est        = 0x0400
+	ct_fin_wait   = 0x0800
+	ct_close_wait = 0x1000
+	ct_last_ack   = 0x2000
+	ct_time_wait  = 0x4000
+	ct_rel        = 0x8000
+)
+
+type attr struct {
+	State uint16
+	Since uint32
+}
+
+type flow struct {
+	Match []match `json:"match"`
+	Stat  []stat  `json:"stat"`
+	Attr  []attr  `json:"attr"`
+}
+
+func newFlow() *flow {
+	return &flow{
+		Match: make([]match, 2, 2),
+		Stat:  make([]stat, 4, 4),
+		Attr:  make([]attr, 2, 2),
+	}
+}
+
 type entry struct {
 	Bytes       uint64 `json:"bytes"`
 	Pkts        uint64 `json:"pkts"`
@@ -98,11 +146,43 @@ func NewCTCli(logger logx.ILogger) IConnTrack {
 }
 
 func (c *ct) parse(ctx context.Context, elems []*elem) ([]string, error) {
-	c.logger.Infow(ctx, "dump cts", "elems", elems)
 	//
 	// tcp 6 431982 ESTABLISHED src=192.168.2.100 dst=123.59.27.117 sport=34846 dport=993 packets=169 bytes=14322 src=123.59.27.117 dst=192.168.2.100 sport=993 dport=34846 packets=113 bytes=34787 [ASSURED] mark=1 secmark=0 use=1
 	//
-	return nil, nil
+	var (
+		fs = make(map[string]*flow)
+		k  string
+	)
+
+	for _, v := range elems {
+		if v.Formatted.Tuple.Dir > 0 { //egress
+			k = fmt.Sprintf("%d%d%d%d%d", v.Formatted.Tuple.Dip, v.Formatted.Tuple.Sip, v.Formatted.Tuple.Dport, v.Formatted.Tuple.Sport, v.Formatted.Tuple.Nexthdr)
+		} else { //ingress
+			k = fmt.Sprintf("%d%d%d%d%d", v.Formatted.Tuple.Sip, v.Formatted.Tuple.Dip, v.Formatted.Tuple.Sport, v.Formatted.Tuple.Dport, v.Formatted.Tuple.Nexthdr)
+		}
+
+		if _, ok := fs[k]; !ok {
+			fs[k] = newFlow()
+		}
+
+		fs[k].Match[v.Formatted.Tuple.Dir%2].Sip = v.Formatted.Tuple.Sip
+		fs[k].Match[v.Formatted.Tuple.Dir%2].Dip = v.Formatted.Tuple.Dip
+		fs[k].Match[v.Formatted.Tuple.Dir%2].Sport = v.Formatted.Tuple.Sport
+		fs[k].Match[v.Formatted.Tuple.Dir%2].Dport = v.Formatted.Tuple.Dport
+		fs[k].Match[v.Formatted.Tuple.Dir%2].Nexthdr = v.Formatted.Tuple.Nexthdr
+		fs[k].Stat[(v.Formatted.Tuple.Rel<<1|v.Formatted.Tuple.Dir)%4].Bytes = v.Formatted.Entry.Bytes
+		fs[k].Stat[(v.Formatted.Tuple.Rel<<1|v.Formatted.Tuple.Dir)%4].Pkts = v.Formatted.Entry.Pkts
+		fs[k].Attr[v.Formatted.Tuple.Dir%2].State = v.Formatted.Entry.State
+		fs[k].Attr[v.Formatted.Tuple.Dir%2].Since = v.Formatted.Entry.Since
+	}
+
+	trks := []string{}
+	for _, v := range fs {
+		trk := fmt.Sprintf("%s %s src=%s dst=%s sport=%d dport=%d rxbytes=%d rxpkts=%d rxrelbytes=%d rxrelpkts=%d %s src=%s dst=%s sport=%d dport=%d txbytes=%d txpkts=%d txrelbytes=%d txrelpkts=%d", c.proto(v.Match[0].Nexthdr), c.state(v.Attr[0].State), c.ip(v.Match[0].Sip), c.ip(v.Match[0].Dip), v.Match[0].Sport, v.Match[0].Dport, v.Stat[0].Bytes, v.Stat[0].Pkts, v.Stat[3].Bytes, v.Stat[3].Pkts, c.state(v.Attr[1].State), c.ip(v.Match[1].Sip), c.ip(v.Match[1].Dip), v.Match[1].Sport, v.Match[1].Dport, v.Stat[1].Bytes, v.Stat[1].Pkts, v.Stat[2].Bytes, v.Stat[2].Pkts)
+		trks = append(trks, trk)
+	}
+
+	return trks, nil
 }
 
 func (c *ct) dump(ctx context.Context) ([]string, error) {
@@ -156,4 +236,55 @@ func (c *ct) dump(ctx context.Context) ([]string, error) {
 
 func (c *ct) ShowConn(ctx context.Context) ([]string, error) {
 	return c.dump(ctx)
+}
+
+func (c *ct) ip(a uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d", uint8(a>>24), uint8(a>>16), uint8(a>>8), uint8(a))
+}
+
+func (c *ct) state(a uint16) string {
+	b := uint16(0x8000)
+
+	for (b&a) == 0 && b > 0 {
+		b = b >> 1
+	}
+	switch b {
+	case ct_null:
+		return "untrack"
+	case ct_new:
+		return "new"
+	case ct_rpl:
+		return "rpl"
+	case ct_syn_sent:
+		return "syn_sent"
+	case ct_syn_recv:
+		return "syn_recv"
+	case ct_est:
+		return "est"
+	case ct_fin_wait:
+		return "fin_wait"
+	case ct_close_wait:
+		return "close_wait"
+	case ct_last_ack:
+		return "last_ack"
+	case ct_time_wait:
+		return "time_wait"
+	case ct_rel:
+		return "rel"
+	default:
+		return "inv"
+	}
+}
+
+func (c *ct) proto(a uint8) string {
+	switch a {
+	case 0x01:
+		return "icmp"
+	case 0x11:
+		return "udp"
+	case 0x06:
+		return "tcp"
+	default:
+		return "unknown"
+	}
 }
