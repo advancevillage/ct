@@ -1,0 +1,9 @@
+{
+    "logCfg": {
+        "level": "info"
+    },
+    "httpCfg": {
+        "host": "192.168.56.105",
+        "port": 6666
+    }
+}
