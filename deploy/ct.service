@@ -1,0 +1,14 @@
+[Unit]
+Description=ct
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/local/ct/
+ExecStart=/usr/local/ct/bin/ct -c /usr/local/ct/conf/ct.json
+Restart=always
+RestartSec=5s
+TimeoutSec=15s
+
+[Install]
+WantedBy=multi-user.target
