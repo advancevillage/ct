@@ -13,9 +13,9 @@ function systemd_uninstall() {
 		systemctl disable $app.service
 	fi
 
-	echo "fwd systemd service units are removed."
+	echo "ct systemd service units are removed."
 	rm -f $SYSTEMD_ROOT/$app.service
 	systemctl daemon-reload
 }
 
-systemd_uninstall fwd
+systemd_uninstall ct

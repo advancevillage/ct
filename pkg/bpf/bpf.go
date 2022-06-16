@@ -146,7 +146,7 @@ func (b *bpf) listProg(ctx context.Context) (map[string]*bpfProg, error) {
 		}
 	}
 
-	b.logger.Infow(ctx, "prog lists", "progs", progsM)
+	b.logger.Debugw(ctx, "prog lists", "progs", progsM)
 	return progsM, nil
 }
 
@@ -173,7 +173,7 @@ func (b *bpf) listMap(ctx context.Context) (map[string]*bpfMap, error) {
 		}
 	}
 
-	b.logger.Infow(ctx, "maps lists", "maps", mapsM)
+	b.logger.Debugw(ctx, "maps lists", "maps", mapsM)
 	return mapsM, nil
 }
 

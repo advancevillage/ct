@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-APP_ROOT=/usr/local/fwd
+APP_ROOT=/usr/local/ct
 SYSTEMD_ROOT=/usr/lib/systemd/system
 
 function systemd_install() {
@@ -15,4 +15,4 @@ function systemd_install() {
 	fi
 }
 
-systemd_install fwd
+systemd_install ct

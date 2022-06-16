@@ -95,7 +95,7 @@ func (c *env) checkMkdir(ctx context.Context) error {
 	}
 	ver := strings.Split(string(buf), "\n")
 	if len(ver) > 0 {
-		c.logger.Infow(ctx, "exec", mkdirCmd, ver[0])
+		c.logger.Debugw(ctx, "exec", mkdirCmd, ver[0])
 	}
 	return nil
 }
@@ -107,7 +107,7 @@ func (c *env) checkMount(ctx context.Context) error {
 	}
 	ver := strings.Split(string(buf), "\n")
 	if len(ver) > 0 {
-		c.logger.Infow(ctx, "exec", mountCmd, ver[0])
+		c.logger.Debugw(ctx, "exec", mountCmd, ver[0])
 	}
 	return nil
 }
@@ -119,7 +119,7 @@ func (c *env) checkBpftool(ctx context.Context) error {
 	}
 	ver := strings.Split(string(buf), "\n")
 	if len(ver) > 0 {
-		c.logger.Infow(ctx, "exec", bpftoolCmd, ver[0])
+		c.logger.Debugw(ctx, "exec", bpftoolCmd, ver[0])
 	}
 	return nil
 }
@@ -131,7 +131,7 @@ func (c *env) checkCLang(ctx context.Context) error {
 	}
 	ver := strings.Split(string(buf), "\n")
 	if len(ver) > 0 {
-		c.logger.Infow(ctx, "exec", clangCmd, ver[0])
+		c.logger.Debugw(ctx, "exec", clangCmd, ver[0])
 	}
 	return nil
 }
@@ -143,7 +143,7 @@ func (c *env) checkUnlink(ctx context.Context) error {
 	}
 	ver := strings.Split(string(buf), "\n")
 	if len(ver) > 0 {
-		c.logger.Infow(ctx, "exec", unlinkCmd, ver[0])
+		c.logger.Debugw(ctx, "exec", unlinkCmd, ver[0])
 	}
 	return nil
 }
@@ -159,7 +159,7 @@ func (c *env) checkBpffs(ctx context.Context) error {
 	if _, err := os.Stat(bpffsRoot); os.IsNotExist(err) {
 		return err
 	}
-	c.logger.Infow(ctx, "exec", bpffsRoot, "exist")
+	c.logger.Debugw(ctx, "exec", bpffsRoot, "exist")
 	return nil
 }
 
@@ -173,7 +173,7 @@ func (c *env) checkProgDir(ctx context.Context) error {
 		return err
 	}
 
-	c.logger.Infow(ctx, "exec", bpffsProgDir, "exist")
+	c.logger.Debugw(ctx, "exec", bpffsProgDir, "exist")
 	return nil
 }
 
@@ -186,6 +186,6 @@ func (c *env) checkMapDir(ctx context.Context) error {
 	} else {
 		return err
 	}
-	c.logger.Infow(ctx, "exec", bpffsMapDir, "exist")
+	c.logger.Debugw(ctx, "exec", bpffsMapDir, "exist")
 	return nil
 }
