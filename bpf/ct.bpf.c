@@ -19,6 +19,20 @@
 #define bpf_ktime_get_sec()	    ({ __u64 __x = bpf_ktime_get_ns() / NSEC_PER_SEC; __x; })
 #define bpf_now()		        bpf_ktime_get_sec()
 
+
+/*
+ *元数据存储:
+ * key | value
+ * ----------
+ *  0  | ktime   系统启动时间s
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key,  __u32);           
+    __type(value,__u64);          
+    __uint(max_entries, 4);
+} meta SEC(".maps"); //meta table
+
 struct {
    __uint(type,         BPF_MAP_TYPE_PROG_ARRAY);
    __type(key,          0x04);
@@ -152,6 +166,12 @@ struct {
    __type(value,        struct ipv4_ct_entry);
    __uint(max_entries,  1024);
 } ctt SEC(".maps");      //conntrack table
+
+static __inline void meta_ktime() {
+    __u64 val = bpf_now(); 
+    __u32 key = 0;
+    bpf_map_update_elem(&meta, &key, &val, BPF_ANY);
+}
 
 static __inline __u16 ct_tcp_state(struct ipv4_ct_entry *rentry, struct ipv4_ct_entry *entry, struct flow *f) {
     __u16 next = ct_new; 
@@ -511,6 +531,7 @@ static __inline void ct_icmp(struct flow *f) {
 */
 PROG(ingress)(struct xdp_md *ctx) {     
     
+    meta_ktime();
     // 封装flow
 	/* Reserve space in-front of data pointer for our meta info.
 	 * (Notice drivers not supporting data_meta will fail here!)
@@ -563,6 +584,7 @@ PROG(ingress)(struct xdp_md *ctx) {
 
 PROG(egress)(struct xdp_md *ctx) {     
     
+    meta_ktime();
     // 封装flow
 	/* Reserve space in-front of data pointer for our meta info.
 	 * (Notice drivers not supporting data_meta will fail here!)

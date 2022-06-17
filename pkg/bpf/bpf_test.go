@@ -23,5 +23,10 @@ func Test_bpf(t *testing.T) {
 		t.Fatal(err)
 		return
 	}
-
+	rr, err := b.Metadata(context.TODO())
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	t.Log(rr)
 }

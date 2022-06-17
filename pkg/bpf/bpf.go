@@ -13,7 +13,9 @@ import (
 )
 
 type IBpfApi interface {
+	GCCT(ctx context.Context, k []byte) error
 	ShowCT(ctx context.Context) ([]byte, error)
+	Metadata(ctx context.Context) ([]uint64, error)
 }
 
 func NewBpfApiClient(logger logx.ILogger) IBpfApi {
@@ -116,6 +118,52 @@ func (b *bpf) Prepare(ctx context.Context) error {
 	return nil
 }
 
+func (b *bpf) Metadata(ctx context.Context) ([]uint64, error) {
+	if err := b.Prepare(ctx); err != nil {
+		return nil, err
+	}
+	//bpftool -j map dump pinned /sys/fs/bpf/map/meta
+	f := fmt.Sprintf("%s/%s", bpffsMapDir, "meta")
+	buf, err := b.ienv.Execute(ctx, bpftoolCmd, "-j", "map", "dump", "pinned", f)
+	if err != nil {
+		return nil, err
+	}
+	//eg: big endian
+	//
+	// [{"key":["0x12","0x34","0x56","0x78"],"value":["0x87","0x65","0x43","0x21"]}]
+	//
+	type kv struct {
+		Key   []string `json:"key"`
+		Value []string `json:"value"`
+	}
+	type kvList []kv
+
+	var r = new(kvList)
+	err = json.Unmarshal(buf, r)
+	if err != nil {
+		return nil, err
+	}
+	var rr = make([]uint64, 8, 8) //和bpf程序统一
+	for i := range *r {
+		var (
+			k = make([]byte, 4)
+			v = make([]byte, 8)
+		)
+		for ii := range (*r)[i].Key {
+			k[ii] = b.hex((*r)[i].Key[ii])
+		}
+		for ii := range (*r)[i].Value {
+			v[ii] = b.hex((*r)[i].Value[ii])
+		}
+
+		kk := uint32(k[3])<<24 | uint32(k[2])<<16 | uint32(k[1])<<8 | uint32(k[0])
+		vv := uint64(v[7])<<56 | uint64(v[6])<<48 | uint64(v[5])<<40 | uint64(v[4])<<32 | uint64(v[3])<<24 | uint64(v[2])<<16 | uint64(v[1])<<8 | uint64(v[0])
+		rr[kk%8] = vv
+	}
+
+	return rr, nil
+}
+
 func (b *bpf) ShowCT(ctx context.Context) ([]byte, error) {
 	if err := b.Prepare(ctx); err != nil {
 		return nil, err
@@ -123,6 +171,27 @@ func (b *bpf) ShowCT(ctx context.Context) ([]byte, error) {
 	//bpftool map dump pinned /sys/fs/bpf/map/ctt
 	f := fmt.Sprintf("%s/%s", bpffsMapDir, "ctt")
 	return b.ienv.Execute(ctx, bpftoolCmd, "-j", "map", "dump", "pinned", f)
+}
+
+func (b *bpf) GCCT(ctx context.Context, k []byte) error {
+	f := fmt.Sprintf("%s/%s", bpffsMapDir, "ctt")
+	kk := make([]string, 0, len(k)+6)
+
+	kk = append(kk, "-j")
+	kk = append(kk, "map")
+	kk = append(kk, "delete")
+	kk = append(kk, "pinned")
+	kk = append(kk, f)
+	kk = append(kk, "key")
+
+	for _, v := range k {
+		kk = append(kk, fmt.Sprintf("%d", v))
+	}
+	_, err := b.ienv.Execute(ctx, bpftoolCmd, kk...)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *bpf) listProg(ctx context.Context) (map[string]*bpfProg, error) {
@@ -169,6 +238,8 @@ func (b *bpf) listMap(ctx context.Context) (map[string]*bpfMap, error) {
 		case "jt":
 			mapsM[v.Name] = v
 		case "ctt":
+			mapsM[v.Name] = v
+		case "meta":
 			mapsM[v.Name] = v
 		}
 	}
@@ -260,4 +331,42 @@ func (b *bpf) fileExist(f string) bool {
 		return false
 	}
 	return true
+}
+
+func (b *bpf) hex(s string) byte {
+	var v = byte(0)
+	var vv = byte(0)
+	//0x12 0xa 12
+	for i := len(s) - 1; i >= 0 && s[i] != 'x'; i-- {
+		switch s[i] {
+		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			vv = s[i] - '0'
+		case 'a', 'A':
+			vv = 10
+		case 'b', 'B':
+			vv = 11
+		case 'c', 'C':
+			vv = 12
+		case 'd', 'D':
+			vv = 13
+		case 'e', 'E':
+			vv = 14
+		case 'f', 'F':
+			vv = 15
+		}
+		v += vv * b.pow(0x10, len(s)-1-i)
+	}
+	return v
+}
+
+func (b *bpf) pow(x, n int) byte {
+	switch {
+	case n <= 0:
+		return 0x01
+	default:
+		for i := 1; i < n; i++ {
+			x *= x
+		}
+		return byte(x)
+	}
 }
